@@ -1,0 +1,303 @@
+We are building AgentCam V1.
+
+Project title:
+AgentCam: Agentic Perception Routing for Camera-Degraded Autonomous Driving
+
+Current dataset:
+- Google Drive file ID: 1ROUN1MkJ2l36KLBsEf_-BNF81xFD2uWe
+- Expected archive name: data_eda_most25.zip
+- The dataset was previously organized for YOLOv8 fine-tuning from COCO-pretrained weights.
+- Assume YOLO-format annotations.
+- Assume only train and test splits currently exist.
+- Assume only two camera degradation types: overexposure and blur.
+- Do NOT assume clean/normal data unless discovered by the data audit.
+- Some images may be unlabeled. Missing label files and empty label files must be distinguished.
+
+Core research scope:
+Implement a reproducible V1 experimental pipeline for camera-degraded dashcam object detection.
+The key contribution is a rule-based agentic perception router, not a learned router, not VLM/LLM reasoning, and not heavy image restoration.
+
+V1 architecture:
+1. YOLOv8 fast detector always runs.
+2. A degradation monitor computes blur_score and overexposure_score.
+3. An uncertainty monitor extracts YOLO confidence statistics.
+4. A rule-based router selects one action:
+   - YOLO_ONLY
+   - EXPOSURE_ENHANCE_THEN_YOLO
+   - SHARPEN_THEN_YOLO
+   - RTDETR_VERIFY
+   - UNCERTAINTY_SIGNAL
+   - TEMPORAL_RECOVERY only if sequence metadata exists; disabled by default.
+5. The system logs selected action, degradation scores, detector confidence, predictions, and latency.
+6. RTX PRO 6000 is the development and offline evaluation platform.
+7. Jetson AGX Orin deployment is a later validation stage after the V1 pipeline works.
+
+Critical split policy:
+The archive has train/test only. Do not tune on test.
+Create these processed splits:
+- train_core: sampled from original train, used for fine-tuning.
+- val_from_train: sampled from original train, used for checkpoint selection and router threshold calibration.
+- test: original test, untouched, final reporting only.
+
+Use stratified sampling by degradation type when splitting original train.
+If sequence_id can be inferred, split by sequence to avoid leakage. If sequence_id cannot be inferred, use image-level stratified split and report this limitation.
+
+Critical label policy:
+- If label .txt exists and is empty, treat as a labeled negative frame.
+- If label .txt is missing, treat as unlabeled.
+- Unlabeled frames can be used for degradation-score statistics and latency measurements.
+- Unlabeled frames must not be used for mAP evaluation or supervised training.
+- Do not silently treat missing label files as empty labels.
+
+T00. Repository setup
+Create:
+AgentCam/
+    README.md
+    requirements.txt
+    .gitignore
+    configs/
+    agentcam/
+    scripts/
+    data/raw/
+    data/processed/
+    weights/
+    artifacts/
+    research/AgentCam_Codex/tasks/INDEX.md
+
+.gitignore must exclude data, weights, artifacts, runs, .pt, .pth, .onnx, .engine, and zip files.
+Maintain task status in research/AgentCam_Codex/tasks/INDEX.md.
+
+T01. Data download and raw archive handling
+Create scripts/00_download_data.sh.
+It should support:
+  gdown --fuzzy "https://drive.google.com/file/d/1ROUN1MkJ2l36KLBsEf_-BNF81xFD2uWe/view" -O data/raw/data_eda_most25.zip
+If gdown fails, print clear manual upload instructions.
+Do not require the script to bypass Google Drive permissions.
+
+T02. Data preparation for train/test-only YOLO data
+Implement:
+agentcam/data/prepare_yolo_train_test.py
+agentcam/data/manifest.py
+
+CLI:
+python -m agentcam.data.prepare_yolo_train_test \
+  --raw data/raw/data_eda_most25.zip \
+  --out data/processed/agentcam \
+  --train_val_ratio 0.85 \
+  --allow_unlabeled \
+  --seed 42
+
+The script must:
+- unzip the raw archive if needed;
+- recursively scan images;
+- identify original split from path: train or test;
+- match YOLO labels by relative path and basename;
+- infer degradation_type from path or filename:
+  blur/blurry -> blur;
+  overexposure/exposure/over_exposure/glare/saturated/sunlight -> overexposure;
+  otherwise unknown;
+- split original train into train_core and val_from_train;
+- preserve original test as test;
+- generate data/processed/agentcam/manifest.csv.
+
+Manifest columns:
+image_path,label_path,has_label,is_empty_label,original_split,split,degradation_type,sequence_id,frame_id,width,height
+
+Also generate:
+- data/processed/agentcam/data_trainval.yaml for YOLO training and validation;
+- data/processed/agentcam/data_test.yaml for final test evaluation;
+- artifacts/data_report.md.
+
+T03. YOLO label validation
+Implement agentcam/data/validate_yolo.py.
+Validate:
+- image can be opened;
+- label line has five fields;
+- class_id is integer;
+- bbox values are floats in [0, 1];
+- width and height are positive;
+- class_id is within data.yaml names;
+- missing label vs empty label distinction;
+- duplicate image basenames;
+- counts by original_split, split, degradation_type, labeled/unlabeled.
+
+T04. Degradation score computation
+Implement:
+agentcam/degradation/metrics.py
+agentcam/degradation/compute_scores.py
+
+For each image compute:
+- laplacian_variance;
+- blur_score, normalized so larger means more blurred;
+- saturated_pixel_ratio;
+- near_white_pixel_ratio;
+- overexposure_score, normalized so larger means more overexposed;
+- contrast;
+- entropy;
+- center_roi_overexposure_score.
+
+Normalization:
+Fit robust normalization on train_core only, apply to val_from_train and test.
+Do not fit score normalization on test.
+
+CLI:
+python -m agentcam.degradation.compute_scores \
+  --data data/processed/agentcam \
+  --out artifacts/scores/degradation_scores.csv
+
+T05. Detector worker abstraction
+Implement:
+agentcam/detectors/base.py
+agentcam/detectors/yolo_worker.py
+agentcam/detectors/rtdetr_worker.py
+
+Detection dataclass:
+image_id, xyxy, score, class_id, source, extra
+
+Each worker exposes:
+predict(image_path) -> List[Detection]
+predict_batch(image_paths) -> Dict[str, List[Detection]]
+
+YOLO worker:
+Use Ultralytics-compatible YOLOv8 weights.
+
+RT-DETR worker:
+Use Ultralytics RT-DETR if available, or another configured RT-DETR implementation.
+If weights are missing, raise a clear error and allow router experiments to skip RT-DETR with --disable_rtdetr.
+
+T06. Baseline training and evaluation
+Implement scripts and modules to run:
+B0: YOLOv8 fine-tuned from COCO-pretrained weights.
+B1: RT-DETR fine-tuned or verifier baseline using the same train_core/val_from_train/test policy.
+B2: EXPOSURE_ENHANCE_THEN_YOLO.
+B3: SHARPEN_THEN_YOLO.
+B4: YOLO_PLUS_RTDETR_ALWAYS.
+
+Create:
+agentcam/evaluation/run_detector.py
+agentcam/data/yolo_to_coco.py
+agentcam/evaluation/coco_eval.py
+agentcam/evaluation/summarize.py
+
+Only labeled test frames are used for mAP.
+
+T07. Lightweight enhancement workers
+Implement agentcam/workers/enhancement.py.
+Functions:
+- exposure_enhance(image): CLAHE, gamma correction, or contrast adjustment;
+- sharpen(image): unsharp mask or lightweight edge enhancement.
+
+No diffusion, GAN, or heavy restoration in V1.
+Enhanced temporary images must be saved under artifacts/cache/.
+Do not modify original images.
+
+T08. Rule-based agentic router
+Implement:
+agentcam/routing/rule_router.py
+agentcam/routing/run_router.py
+
+Router inputs:
+- blur_score;
+- overexposure_score;
+- saturated_pixel_ratio;
+- YOLO mean confidence;
+- YOLO max confidence;
+- number of YOLO detections;
+- low-confidence detection ratio;
+- optional temporal consistency, only if sequence metadata exists;
+- latency_budget_ms.
+
+Actions:
+YOLO_ONLY
+EXPOSURE_ENHANCE_THEN_YOLO
+SHARPEN_THEN_YOLO
+RTDETR_VERIFY
+UNCERTAINTY_SIGNAL
+TEMPORAL_RECOVERY disabled by default.
+
+Thresholds:
+Configured in configs/router_rule.yaml.
+Support quantile-based thresholds calibrated on val_from_train only.
+Do not tune thresholds on test.
+
+CLI:
+python -m agentcam.routing.run_router \
+  --data data/processed/agentcam \
+  --scores artifacts/scores/degradation_scores.csv \
+  --yolo_weights artifacts/runs/yolov8_agentcam/weights/best.pt \
+  --rtdetr_weights weights/rtdetr_agentcam.pt \
+  --config configs/router_rule.yaml \
+  --split test \
+  --out artifacts/predictions/agentcam_router_test.json \
+  --log artifacts/logs/router_test.jsonl
+
+T09. Fusion logic
+Implement agentcam/routing/fusion.py.
+V1 fusion:
+- start with YOLO detections;
+- if enhanced YOLO is called, replace boxes only when class matches, IoU > 0.5, and enhanced score is higher;
+- if RT-DETR is called, merge YOLO and RT-DETR detections using class-aware NMS;
+- keep source tags;
+- log frame-level uncertainty_signal.
+
+T10. Latency measurement
+Implement agentcam/evaluation/latency.py.
+Measure batch-size-1 latency with warmup and CUDA synchronization.
+Log:
+- degradation_monitor_ms;
+- yolo_ms;
+- enhancement_ms;
+- rtdetr_ms;
+- router_ms;
+- fusion_ms;
+- total_ms;
+- selected_action.
+Report mean, p50, p90, p95, max.
+
+T11. Offline oracle analysis
+Implement agentcam/routing/oracle.py.
+For each labeled test frame, compare candidate actions:
+YOLO_ONLY, RTDETR_ONLY, EXPOSURE_ENHANCE_THEN_YOLO, SHARPEN_THEN_YOLO, YOLO_PLUS_RTDETR_ALWAYS.
+Compute an upper-bound action choice using:
+utility = detection_metric_gain - lambda_latency * latency_ms - beta_critical_miss * critical_miss
+
+This is analysis only. Do not use test labels to tune the deployed rule-based router.
+
+T12. Result tables and figures
+Generate:
+1. Detection robustness table:
+method, mAP50, mAP50-95, precision, recall, critical_FN_rate, blur_mAP, overexposure_mAP.
+2. Latency and routing table:
+method, mean_latency_ms, p50_latency_ms, p95_latency_ms, rtdetr_call_rate, enhancement_call_rate, uncertainty_signal_rate.
+3. Score quantile table:
+blur_score bottom/middle/top 33%, overexposure_score bottom/middle/top 33%, with YOLO, RT-DETR, AgentCam metrics.
+4. Router ablation:
+YOLO only, router without degradation score, router without uncertainty score, router without RT-DETR, full AgentCam router, oracle upper bound.
+5. Figures:
+degradation histograms, action distribution, latency distribution, representative failure/recovery cases.
+
+T13. Dry-run and tests
+All scripts must support --limit N and --dry_run.
+Add tests for:
+- YOLO label parsing;
+- missing vs empty label handling;
+- train/test to train_core/val_from_train/test split;
+- degradation type inference;
+- YOLO to COCO conversion;
+- degradation score sanity on synthetic sharp/blurred/overexposed images;
+- rule router action choices.
+
+Definition of done:
+1. Repo structure exists.
+2. Drive download script exists but does not assume it can bypass permissions.
+3. train/test-only YOLO archive is prepared into train_core, val_from_train, and test.
+4. manifest.csv and data_report.md are generated.
+5. degradation_scores.csv is generated with train-only normalization.
+6. YOLOv8 baseline can train/evaluate on a dry run.
+7. Router can run on a dry run.
+8. Router logs JSONL with action, scores, confidence, and latency.
+9. Evaluation produces CSV/JSON summaries.
+10. README documents the exact commands, dataset assumptions, and limitations.
+11. research/AgentCam_Codex/tasks/INDEX.md records task status.
+
+Do not make unsupported performance claims. The goal is a reproducible experimental framework first.

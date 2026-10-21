@@ -1,0 +1,40 @@
+# Runtime data and generated artifacts
+data/
+artifacts/
+runs/
+logs/
+outputs/
+wandb/
+
+# Model/export files
+weights/*.pt
+weights/*.pth
+weights/*.onnx
+weights/*.engine
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+ag1_venv/
+*_venv/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,28 @@
+thresholds:
+  blur_score: 0.70
+  overexposure_score: 0.70
+  low_mean_confidence: 0.35
+  low_max_confidence: 0.45
+  low_confidence_ratio: 0.50
+  low_confidence_detection_threshold: 0.30
+  rtdetr_min_budget_ms: 80.0
+  enhancement_min_budget_ms: 35.0
+  uncertainty_signal_budget_ms: 0.0
+
+calibration:
+  enabled: true
+  split: val_from_train
+  blur_quantile: 0.67
+  overexposure_quantile: 0.67
+
+router:
+  enable_rtdetr: true
+  enable_temporal_recovery: false
+  default_latency_budget_ms: 100.0
+
+priority:
+  - temporal_recovery
+  - exposure_enhance
+  - sharpen
+  - rtdetr_verify
+  - uncertainty_signal

@@ -1,0 +1,1 @@
+"""Camera degradation metrics."""
